@@ -34,15 +34,24 @@ func main() {
 
 	dist := m.Dist()
 	m.VerifyEdges()
-	e0, e1, e2, e3 := m.edgeN[0], m.edgeN[1], m.edgeN[2], m.edgeN[3]
-	nv := int64(m.count)
-	ne := int64(len(m.edge)) - e0
 	//m.Save("model.binvox")
 
-	fmt.Printf("grid:        %d x %d x %d = %d\n", m.d, m.h, m.w, len(m.grid))
+	e0, e1, e2, e3 := m.edgeN[0], m.edgeN[1], m.edgeN[2], m.edgeN[3]
+	ng := int64(len(m.grid))
+	nv := int64(m.count)
+	ne := int64(len(m.edge)) - e0
+	md := float64(m.md) * m.vs
+	mh := float64(m.mh) * m.vs
+	mw := float64(m.mw) * m.vs
+
+	fmt.Printf("grid:        %d x %d x %d = %d\n", m.gd, m.gh, m.gw, ng)
 	fmt.Printf("translation: %v\n", m.tx)
 	fmt.Printf("scale:       %f\n", m.scale)
-	fmt.Printf("voxels:      %d (%.3f%%)\n", nv, pct(nv, int64(len(m.grid))))
+	fmt.Printf("model:       %d x %d x %d\n", m.md, m.mh, m.mw)
+	fmt.Printf("  depth:     %f (%f scaled)\n", md, md*m.scale)
+	fmt.Printf("  height:    %f (%f scaled)\n", mh, mh*m.scale)
+	fmt.Printf("  width:     %f (%f scaled)\n", mw, mw*m.scale)
+	fmt.Printf("voxels:      %d (%.3f%%)\n", nv, pct(nv, ng))
 	fmt.Printf("  orphans:   %d (%.1f%%)\n", e0, pct(e0, nv))
 	fmt.Printf("  size:      %f (%f scaled)\n", m.vs, m.vs*m.scale)
 	fmt.Printf("edges:       %d (%.1f%%)\n", ne, pct(ne, nv))
@@ -89,17 +98,18 @@ func (e Edge) Dim() int {
 // coordinates, which are converted to a linear index in the grid bitmap
 // according to the binvox file format.
 type Model struct {
-	grid    []bool            // Voxel bitmap
-	edge    map[Edge]struct{} // Adjacency map
-	edgeN   [4]int64          // Edge count by dimension
-	edgeR   int64             // Number of removed edges by simplification
-	d, h, w int               // Grid depth, height, and width
-	wh      int               // Cached width * height
-	count   int               // Voxel count
-	tx      [3]float64        // Model translation
-	scale   float64           // Model scale
-	vs      float64           // Voxel size
-	epv     float64           // Average number of edges per voxel
+	grid       []bool            // Voxel bitmap
+	edge       map[Edge]struct{} // Adjacency map
+	edgeN      [4]int64          // Edge count by dimension
+	edgeR      int64             // Number of removed edges by simplification
+	gd, gh, gw int               // Grid depth, height, and width
+	md, mh, mw int               // Model depth, height, and width
+	wh         int               // Cached width * height
+	count      int               // Voxel count
+	tx         [3]float64        // Model translation
+	scale      float64           // Model scale
+	vs         float64           // Voxel size
+	epv        float64           // Average number of edges per voxel
 }
 
 // LoadModel loads the model from a binvox file.
@@ -121,16 +131,17 @@ func LoadModel(name string) (*Model, error) {
 	if _, err = fmt.Fscanf(r, "dim %d %d %d\n", &d, &h, &w); err != nil {
 		return nil, err
 	}
-	if d > maxDim || h > maxDim || w > maxDim {
+	dim := int(maxUint16(maxUint16(d, h), w))
+	if dim > maxDim {
 		return nil, fmt.Errorf("invalid dimensions: %d x %d x %d", d, h, w)
 	}
 	m := &Model{
 		grid: make([]bool, int(d)*int(h)*int(w)),
-		d:    int(d),
-		h:    int(h),
-		w:    int(w),
+		gd:   int(d),
+		gh:   int(h),
+		gw:   int(w),
 		wh:   int(w) * int(h),
-		vs:   1.0 / float64(maxUint16(maxUint16(d, h), w)),
+		vs:   1.0 / float64(dim),
 	}
 
 	// Read rest of header
@@ -146,6 +157,8 @@ func LoadModel(name string) (*Model, error) {
 	}
 
 	// Read grid data (format is bool | count, 1 byte each)
+	minx, miny, minz := dim, dim, dim
+	maxx, maxy, maxz := -1, -1, -1
 	for i, b := 0, byte(0); i < len(m.grid); {
 		if b, err = r.ReadByte(); err != nil {
 			return nil, err
@@ -157,6 +170,10 @@ func LoadModel(name string) (*Model, error) {
 		if i += int(b); set {
 			for j := i - int(b); j < i; j++ {
 				m.grid[j] = true
+				x, y, z := m.xyz(j)
+				updateMinMax(x, &minx, &maxx)
+				updateMinMax(y, &miny, &maxy)
+				updateMinMax(z, &minz, &maxz)
 			}
 			m.count += int(b)
 		}
@@ -166,6 +183,13 @@ func LoadModel(name string) (*Model, error) {
 			err = fmt.Errorf("unexpected data past end of grid")
 		}
 		return nil, err
+	}
+
+	// Update model dimensions
+	if m.count > 0 {
+		m.md = maxx - minx + 1
+		m.mh = maxz - minz + 1
+		m.mw = maxy - miny + 1
 	}
 	return m, nil
 }
@@ -182,7 +206,7 @@ func (m *Model) Save(name string) error {
 	// Write header
 	w := bufio.NewWriter(f)
 	w.WriteString(sig)
-	fmt.Fprintf(w, "dim %d %d %d\n", m.d, m.h, m.w)
+	fmt.Fprintf(w, "dim %d %d %d\n", m.gd, m.gh, m.gw)
 	fmt.Fprintf(w, "translate %.4f %.4f %.4f\n", m.tx[0], m.tx[1], m.tx[2])
 	fmt.Fprintf(w, "scale %.4f\n", m.scale)
 	w.WriteString("data\n")
@@ -298,20 +322,20 @@ func (m *Model) findEdges() {
 			edgeCount := 0
 			for dx := -1; dx <= 1; dx++ {
 				x := ix + dx
-				if x < 0 || m.d <= x {
+				if x < 0 || m.gd <= x {
 					continue
 				}
 				x *= m.wh
 				for dz := -1; dz <= 1; dz++ {
 					z := iz + dz
-					if z < 0 || m.h <= z {
+					if z < 0 || m.gh <= z {
 						continue
 					}
-					z *= m.w
+					z *= m.gw
 					for dy := -1; dy <= 1; dy++ {
 						y := iy + dy
 						j := x + z + y // x and z are premultiplied
-						if y < 0 || m.w <= y || !m.grid[j] || i == j {
+						if y < 0 || m.gw <= y || !m.grid[j] || i == j {
 							continue
 						}
 						if edgeCount++; i < j {
@@ -370,15 +394,15 @@ func (m *Model) isSimple(e Edge) bool {
 
 // idx converts xyz coordinates to a linear index.
 func (m *Model) idx(x, y, z int) int {
-	return x*m.wh + z*m.w + y
+	return x*m.wh + z*m.gw + y
 }
 
 // xyz converts a linear index to xyz coordinates.
 func (m *Model) xyz(i int) (x, y, z int) {
 	x = i / m.wh
 	i -= x * m.wh
-	z = i / m.w
-	y = i - z*m.w
+	z = i / m.gw
+	y = i - z*m.gw
 	return
 }
 
@@ -420,4 +444,14 @@ func maxUint16(a, b uint16) uint16 {
 		return a
 	}
 	return b
+}
+
+// updateMinMax uses v to update min and max values.
+func updateMinMax(v int, min, max *int) {
+	if v < *min {
+		*min = v
+	}
+	if v > *max {
+		*max = v
+	}
 }
